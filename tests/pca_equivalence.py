@@ -45,6 +45,24 @@ def main():
     assert np.allclose(load.T @ load, np.eye(k)), "loadings not orthonormal"
     print(f"OK: k={k}, max |d| embedding {d_emb:.1e}, loadings {d_load:.1e}")
 
+    # --n_components: n == TW rank is the default path bit for bit; below it, a
+    # prefix; above it, still PCA of the z-scored matrix (rm.X was projected
+    # onto the signal subspace, so those loadings need the rebuilt Z).
+    e, l = ndimr.embed(rm, k, X)
+    assert e.equals(emb) and l.equals(load), "n_components == TW rank differs from default"
+    e, l = ndimr.embed(rm, k - 2, X)
+    assert e.equals(emb.iloc[:, :k - 2]) and l.equals(load.iloc[:, :k - 2])
+    m = k + 10
+    e, l = ndimr.embed(rm, m, X)
+    p = PCA(n_components=m, svd_solver="full").fit(Xz)
+    sign = np.sign(np.sum(p.components_.T * l.to_numpy(), axis=0))
+    d_emb = np.abs(p.transform(Xz) * sign - e.to_numpy()).max()
+    d_load = np.abs(p.components_.T * sign - l.to_numpy()).max()
+    assert d_emb < 1e-8 and d_load < 1e-8, f"n={m}: |d| {d_emb:.2e} / {d_load:.2e}"
+    assert np.allclose(l.T @ l, np.eye(m)), f"n={m}: loadings not orthonormal"
+    print(f"OK: --n_components {k} == default, {k - 2} prefix, {m} == PCA "
+          f"(|d| {d_emb:.1e} / {d_load:.1e})")
+
 
 if __name__ == "__main__":
     main()

@@ -14,10 +14,15 @@ X = U S W^T: the eigenvectors of Y are U and its eigenvalues S^2 / g, so
 
 (tests/pca_equivalence.py checks both against sklearn's PCA).
 
+--n_components N (ablation) keeps the top N of the full spectrum instead,
+separating the Tracy-Widom rank rule from the z-scoring. The TW rank is still
+computed, logged and written to {name}_randomly.json.
+
 Cost is O(n_cells^2) memory and O(n_cells^3) time, twice (data + shuffle).
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -46,6 +51,10 @@ def parse_args():
                    help="seed of the column shuffle behind the Marchenko-Pastur fit")
     p.add_argument("--backend", choices=["numpy", "cupy"], default="numpy",
                    help="eigh on CPU (scipy) or GPU (cupy, float64)")
+    # ponytail: an ablation, not a headline parameter. Unset = the TW rank.
+    p.add_argument("--n_components", type=int, default=None,
+                   help="ablation: keep the top N of the FULL spectrum instead of the "
+                        "components above Tracy-Widom (may be above or below that rank)")
     return p.parse_args()
 
 
@@ -76,12 +85,30 @@ def fit(X, backend="numpy", seed=0):
     return rm
 
 
-def embed(rm):
-    """Signal components, largest first -> (embedding, loadings) DataFrames."""
-    L, V = rm.Ls[::-1], rm.Vs[:, ::-1]  # eigh returns ascending
+def embed(rm, n=None, X=None):
+    """Components, largest first -> (embedding, loadings) DataFrames.
+
+    n=None: the signal components above Tracy-Widom. n: the top n of the full
+    spectrum (rm.L / rm.V keep every eigenpair), which for n <= the TW rank are
+    exactly the leading signal columns, so n == TW rank reproduces n=None.
+    X (the DataFrame fit() was given) is only needed for n above the TW rank.
+    """
+    if n is None:
+        L, V = rm.Ls[::-1], rm.Vs[:, ::-1]  # eigh returns ascending
+    else:
+        L, V = rm.L[::-1][:n], rm.V[:, ::-1][:, :n]
+        if not (L > 0).all():
+            raise ValueError(f"--n_components {n} reaches eigenvalue {L.min():.3g}: "
+                             "past the rank of the centred matrix")
     scale = np.sqrt(rm.n_genes * L)
-    # _fit leaves rm.X = V_s V_s^T X; its projection on V_s equals X^T V_s
-    loadings = rm.X.T @ V / scale
+    # _fit leaves rm.X = V_s V_s^T Z (Z the z-scored input); its projection on
+    # V_s equals Z^T V_s. Above the TW rank that projection has discarded what we
+    # need, so rebuild Z exactly as _fit did.
+    if n is None or n <= rm.n_components:
+        Z = rm.X
+    else:
+        Z = (X.loc[:, rm.normal_genes].to_numpy() - rm.mean_) / (rm.std_ + 0.0)
+    loadings = Z.T @ V / scale
     pcs = [f"PC{i + 1}" for i in range(len(L))]
     return (pd.DataFrame(V * scale, index=rm.normal_cells, columns=pcs),
             pd.DataFrame(loadings, index=rm.normal_genes, columns=pcs))
@@ -95,14 +122,25 @@ def main():
         raise ValueError(f"{X.shape[0]} cells > MAX_CELLS={MAX_CELLS}: the n_cells^2 "
                          "Wishart does not fit on CPU; use the GPU arm")
 
+    n = args.n_components
+    if n is not None and not 1 <= n <= X.shape[0]:
+        raise ValueError(f"--n_components {n} outside [1, n_cells={X.shape[0]}]")
+
     rm = fit(X, args.backend, args.random_seed)
     print(f"signal components above Tracy-Widom: {rm.n_components}")
-    if rm.n_components == 0:
+    if n is None and rm.n_components == 0:
         raise ValueError("no components above the Tracy-Widom edge: no signal to embed")
-    embedding, loadings = embed(rm)
+    print(f"components used: {rm.n_components if n is None else n}"
+          f"{'' if n is None else ' (--n_components ablation)'}")
+    embedding, loadings = embed(rm, n, X)
 
     out = Path(args.output_dir)
     out.mkdir(parents=True, exist_ok=True)
+    # diagnostics, not a stage output: the TW rank survives an --n_components override
+    (out / f"{args.name}_randomly.json").write_text(json.dumps(
+        {"tw_rank": int(rm.n_components), "n_components_used": embedding.shape[1],
+         "lambda_c": float(rm.lambda_c), "n_cells": int(rm.n_cells),
+         "n_genes": int(rm.n_genes), "random_seed": args.random_seed}, indent=2))
     embedding.to_csv(out / f"{args.name}_embedding.tsv", sep="\t", index_label="cell_id")
     loadings.to_csv(out / f"{args.name}_loadings.tsv", sep="\t", index_label="gene")
 
